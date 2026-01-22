@@ -20,7 +20,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	sdkretry "github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-provider-aws/internal/create"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs/fwdiag"
@@ -325,9 +324,8 @@ func findReplicationConfigurationTemplates(ctx context.Context, conn *drs.Client
 		page, err := pages.NextPage(ctx)
 
 		if errs.IsA[*awstypes.ResourceNotFoundException](err) {
-			return nil, &sdkretry.NotFoundError{
-				LastError:   err,
-				LastRequest: input,
+			return nil, &retry.NotFoundError{
+				LastError: err,
 			}
 		}
 
@@ -353,8 +351,8 @@ const (
 	replicationConfigurationTemplateAvailable = "AVAILABLE"
 )
 
-func statusReplicationConfigurationTemplate(ctx context.Context, conn *drs.Client, id string) sdkretry.StateRefreshFunc {
-	return func() (any, string, error) {
+func statusReplicationConfigurationTemplate(conn *drs.Client, id string) retry.StateRefreshFunc {
+	return func(ctx context.Context) (any, string, error) {
 		output, err := findReplicationConfigurationTemplateByID(ctx, conn, id)
 
 		if retry.NotFound(err) {
@@ -369,10 +367,10 @@ func statusReplicationConfigurationTemplate(ctx context.Context, conn *drs.Clien
 }
 
 func waitReplicationConfigurationTemplateAvailable(ctx context.Context, conn *drs.Client, id string, timeout time.Duration) (*awstypes.ReplicationConfigurationTemplate, error) {
-	stateConf := &sdkretry.StateChangeConf{
+	stateConf := &retry.StateChangeConf{
 		Pending:    []string{},
 		Target:     []string{replicationConfigurationTemplateAvailable},
-		Refresh:    statusReplicationConfigurationTemplate(ctx, conn, id),
+		Refresh:    statusReplicationConfigurationTemplate(conn, id),
 		Timeout:    timeout,
 		MinTimeout: 10 * time.Second,
 		Delay:      30 * time.Second,
@@ -388,10 +386,10 @@ func waitReplicationConfigurationTemplateAvailable(ctx context.Context, conn *dr
 }
 
 func waitReplicationConfigurationTemplateDeleted(ctx context.Context, conn *drs.Client, id string, timeout time.Duration) (*awstypes.ReplicationConfigurationTemplate, error) {
-	stateConf := &sdkretry.StateChangeConf{
+	stateConf := &retry.StateChangeConf{
 		Pending:    []string{replicationConfigurationTemplateAvailable},
 		Target:     []string{},
-		Refresh:    statusReplicationConfigurationTemplate(ctx, conn, id),
+		Refresh:    statusReplicationConfigurationTemplate(conn, id),
 		Timeout:    timeout,
 		MinTimeout: 10 * time.Second,
 		Delay:      30 * time.Second,
