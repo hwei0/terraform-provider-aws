@@ -521,11 +521,28 @@ func processResourceFile(inputPath string, serviceDirName string, extractorPath 
 				continue
 			}
 
-			resourceElemValue, ok := resourceKeyValElem.Value.(*ast.Ident)
-			if !ok {
+			switch resourceElemValue := resourceKeyValElem.Value.(type) {
+			case *ast.Ident:
+				resourceCreateFuncNameList = append(resourceCreateFuncNameList, resourceElemValue.Name)
+				break
+			case *ast.CallExpr:
+				// glue resource_policy.go
+				resourceElemValueAlternateIdent, okAlt2 := resourceElemValue.Fun.(*ast.Ident)
+
+				if !okAlt2 {
+					continue
+				}
+
+				resourceCreateFuncNameList = append(resourceCreateFuncNameList, resourceElemValueAlternateIdent.Name)
+				break
+			case *ast.SelectorExpr:
+				// sqs queue_policy.go
+				identName := resourceElemValue.Sel.Name
+				resourceCreateFuncNameList = append(resourceCreateFuncNameList, identName)
+				break
+			default:
 				continue
 			}
-			resourceCreateFuncNameList = append(resourceCreateFuncNameList, resourceElemValue.Name)
 		}
 
 		return true
@@ -565,6 +582,19 @@ func processResourceFile(inputPath string, serviceDirName string, extractorPath 
 			resourceCreateFunctionNode = funcNode
 			return true
 		})
+
+		if resourceCreateFunctionNode == nil {
+			//special handling for sqs queue_policy.go
+			funcDeclList, ok := allServiceFuncDecl[resourceCreateFuncName]
+			if !ok {
+				return false, fmt.Errorf("did not find resourceCreateFunction: %s\n", resourceCreateFuncName)
+			}
+			if len(*funcDeclList) > 1 {
+				return false, fmt.Errorf("tried going outside for functions matching %s, but found more than one.\n", resourceCreateFuncName)
+			}
+
+			resourceCreateFunctionNode = (*funcDeclList)[0]
+		}
 
 		// Extract SDK call positions from the file
 		sdkPositions, err := extractSDKCallPositions(inputPath, extractorPath)
@@ -745,6 +775,10 @@ func main() {
 
 		serviceDirName := entry.Name()
 		servicePath := filepath.Join(inputDir, serviceDirName)
+
+		// if serviceDirName != "sqs" {
+		// 	continue
+		// }
 
 		fmt.Printf("Processing service: %s\n", serviceDirName)
 
