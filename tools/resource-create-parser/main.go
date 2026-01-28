@@ -12,10 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
+
+//TODO: MAKE SURE THIS HANDLES @SdkListResource and @FrameworkListResource
 
 // SDKCallMetadata represents the metadata for an SDK call from the extract-sdk-calls command
 type SDKCallMetadata struct {
@@ -291,8 +292,8 @@ type InitialFuncDeclTracker struct {
 type CreateCallMetadata struct {
 	ServiceDirName        string
 	FilePath              string
-	TerraformResourceName []string
-	SdkResourceName       []string
+	TerraformResourceName string
+	SdkResourceName       string
 	CreateFunctionName    string
 	ResourceDecorators    []string
 	FirstCallRow          int
@@ -303,6 +304,7 @@ type CreateCallMetadata struct {
 	IntermediateFuncDecls []token.Position
 	AfterFuncDecls        []token.Position
 	AllFuncDecls          []token.Position
+	ResourceDatum         ResourceDatum
 }
 
 // MUST UPDATE RESLIST, FUNCDECLANALYZEDSTATUS BEFORE CALLING THIS FUNCTION.
@@ -452,6 +454,30 @@ func processResourceFile(inputPath string, serviceDirName string, extractorPath 
 		return false, nil //fmt.Errorf("parsing %s failed as resource header not found", inputPath)
 	}
 
+	v := &visitor{
+		actions:                make(map[string]ResourceDatum, 0),
+		ephemeralResources:     make(map[string]ResourceDatum, 0),
+		frameworkDataSources:   make(map[string]ResourceDatum, 0),
+		frameworkListResources: make(map[string]ResourceDatum, 0),
+		frameworkResources:     make(map[string]ResourceDatum, 0),
+		sdkDataSources:         make(map[string]ResourceDatum, 0),
+		sdkResources:           make(map[string]ResourceDatum, 0),
+		sdkListResources:       make(map[string]ResourceDatum, 0),
+	}
+
+	v.Visit(resourceHeaderNode)
+
+	if len(v.errs) != 0 {
+		for _, vErr := range v.errs {
+			fmt.Printf("[error] Error encountered while traversing resource header in %s: %s\n", inputPath, vErr.Error())
+		}
+		return false, v.errs[0]
+	}
+
+	if len(v.sdkResources) == 0 {
+		return false, nil
+	}
+
 	resourceHeaderComments := make([]string, 0)
 	if resourceHeaderNode.Doc != nil {
 		for _, commentNode := range resourceHeaderNode.Doc.List {
@@ -465,20 +491,32 @@ func processResourceFile(inputPath string, serviceDirName string, extractorPath 
 
 	// Extract terraform resource name and SDK resource name from @SDKResource decorator
 	// Pattern allows for whitespaces after // and multiple additional slashes
-	terraformResourceName := make([]string, 0)
-	sdkResourceName := make([]string, 0)
-	sdkResourcePattern := regexp.MustCompile(`\s*//\s*/*\s*@SDKResource\(\s*"([^"]+)"\s*,\s*name="([^"]+)"\s*\)`)
+	// terraformResourceName := make([]string, 0)
+	// sdkResourceName := make([]string, 0)
+	// sdkResourcePattern := regexp.MustCompile(`\s*//\s*/*\s*@SDKResource\(\s*"([^"]+)"\s*,\s*name="([^"]+)"\s*\)`)
 
-	for _, comment := range resourceHeaderComments {
-		matches := sdkResourcePattern.FindStringSubmatch(comment)
-		if len(matches) == 3 {
-			terraformResourceName = append(terraformResourceName, matches[1]) // e.g., "aws_acm_certificate"
-			sdkResourceName = append(sdkResourceName, matches[2])             // e.g., "Certificate"
-		}
-	}
+	// for _, comment := range resourceHeaderComments {
+	// 	matches := sdkResourcePattern.FindStringSubmatch(comment)
+	// 	if len(matches) == 3 {
+	// 		terraformResourceName = append(terraformResourceName, matches[1]) // e.g., "aws_acm_certificate"
+	// 		sdkResourceName = append(sdkResourceName, matches[2])             // e.g., "Certificate"
+	// 	}
+	// }
 
-	if len(terraformResourceName) == 0 {
-		return false, nil
+	// if len(terraformResourceName) == 0 {
+	// 	return false, nil
+	// }
+
+	terraformResourceNameList := make([]string, len(v.sdkResources))
+	sdkResourceNameList := make([]string, len(v.sdkResources))
+	resourceDatumList := make([]ResourceDatum, len(v.sdkResources))
+
+	cntIdx := 0
+	for typeName, d := range v.sdkResources {
+		terraformResourceNameList[cntIdx] = typeName
+		sdkResourceNameList[cntIdx] = d.Name
+		resourceDatumList[cntIdx] = d
+		cntIdx += 1
 	}
 
 	resourceCreateFuncNameList := make([]string, 0)
@@ -667,80 +705,84 @@ func processResourceFile(inputPath string, serviceDirName string, extractorPath 
 			return false, err
 		}
 
-		metadataStruct := CreateCallMetadata{
-			ServiceDirName:        serviceDirName,
-			FilePath:              inputPath,
-			TerraformResourceName: terraformResourceName,
-			SdkResourceName:       sdkResourceName,
-			CreateFunctionName:    resourceCreateFuncName,
-			ResourceDecorators:    resourceHeaderComments,
-			FirstCallRow:          firstSdkPosition.Line,
-			FirstCallCol:          firstSdkPosition.Column,
-			LastCallRow:           lastSdkPosition.Line,
-			LastCallCol:           lastSdkPosition.Column,
-			BeforeFuncDecls:       extractPositions(allServiceFileSet, *initFuncDeclTracker.beforeFuncDeclList),
-			IntermediateFuncDecls: extractPositions(allServiceFileSet, *initFuncDeclTracker.intermediateFuncDeclList),
-			AfterFuncDecls:        extractPositions(allServiceFileSet, *initFuncDeclTracker.afterFuncDeclList),
-			AllFuncDecls:          extractPositions(allServiceFileSet, *initFuncDeclTracker.afterFuncDeclList),
-		}
-
 		// Create subdirectory using the terraform resource name
-		var resourceOutputPath string
-		if len(terraformResourceName) > 0 {
-			resourceOutputPath = filepath.Join(outputPath, terraformResourceName[0])
-		} else {
+		if len(terraformResourceNameList) == 0 {
 			return false, fmt.Errorf("did not get terraformResourceName")
 		}
 
-		// Write before_calls.go
-		beforeCallsPath := filepath.Join(resourceOutputPath, "before_calls.go")
-		if err := writeFunctionsToFile(beforeFuncDeclList, fileNode, beforeCallsPath); err != nil {
-			return false, fmt.Errorf("writing before_calls.go: %w", err)
-		}
+		for idx, terraformResourceName := range terraformResourceNameList {
+			resourceOutputPath := filepath.Join(outputPath, terraformResourceName)
+			resourceDatum := resourceDatumList[idx]
+			sdkResourceName := sdkResourceNameList[idx]
 
-		// Write intermediate_calls.go
-		intermediateCallsPath := filepath.Join(resourceOutputPath, "intermediate_calls.go")
-		if err := writeFunctionsToFile(intermediateFuncDeclList, fileNode, intermediateCallsPath); err != nil {
-			return false, fmt.Errorf("writing intermediate_calls.go: %w", err)
-		}
+			metadataStruct := CreateCallMetadata{
+				ServiceDirName:        serviceDirName,
+				FilePath:              inputPath,
+				TerraformResourceName: terraformResourceName,
+				SdkResourceName:       sdkResourceName,
+				CreateFunctionName:    resourceCreateFuncName,
+				ResourceDecorators:    resourceHeaderComments,
+				ResourceDatum:         resourceDatum,
+				FirstCallRow:          firstSdkPosition.Line,
+				FirstCallCol:          firstSdkPosition.Column,
+				LastCallRow:           lastSdkPosition.Line,
+				LastCallCol:           lastSdkPosition.Column,
+				BeforeFuncDecls:       extractPositions(allServiceFileSet, *initFuncDeclTracker.beforeFuncDeclList),
+				IntermediateFuncDecls: extractPositions(allServiceFileSet, *initFuncDeclTracker.intermediateFuncDeclList),
+				AfterFuncDecls:        extractPositions(allServiceFileSet, *initFuncDeclTracker.afterFuncDeclList),
+				AllFuncDecls:          extractPositions(allServiceFileSet, *initFuncDeclTracker.afterFuncDeclList),
+			}
 
-		// Write after_calls.go
-		afterCallsPath := filepath.Join(resourceOutputPath, "after_calls.go")
-		if err := writeFunctionsToFile(afterFuncDeclList, fileNode, afterCallsPath); err != nil {
-			return false, fmt.Errorf("writing after_calls.go: %w", err)
-		}
+			// Write before_calls.go
+			beforeCallsPath := filepath.Join(resourceOutputPath, "before_calls.go")
+			if err := writeFunctionsToFile(beforeFuncDeclList, fileNode, beforeCallsPath); err != nil {
+				return false, fmt.Errorf("writing before_calls.go: %w", err)
+			}
 
-		// Write create_function_calls.go
-		createFunctionCallsPath := filepath.Join(resourceOutputPath, "create_function_calls.go")
-		if err := writeFunctionsToFile(allFuncDeclList, fileNode, createFunctionCallsPath); err != nil {
-			return false, fmt.Errorf("writing create_function_calls.go: %w", err)
-		}
+			// Write intermediate_calls.go
+			intermediateCallsPath := filepath.Join(resourceOutputPath, "intermediate_calls.go")
+			if err := writeFunctionsToFile(intermediateFuncDeclList, fileNode, intermediateCallsPath); err != nil {
+				return false, fmt.Errorf("writing intermediate_calls.go: %w", err)
+			}
 
-		// Write create_function_only.go
-		createFunctionOnlyPath := filepath.Join(resourceOutputPath, "create_function_only.go")
-		if err := writeFunctionsToFile([]*ast.FuncDecl{resourceCreateFunctionNode}, fileNode, createFunctionOnlyPath); err != nil {
-			return false, fmt.Errorf("writing create_function_only.go: %w", err)
-		}
+			// Write after_calls.go
+			afterCallsPath := filepath.Join(resourceOutputPath, "after_calls.go")
+			if err := writeFunctionsToFile(afterFuncDeclList, fileNode, afterCallsPath); err != nil {
+				return false, fmt.Errorf("writing after_calls.go: %w", err)
+			}
 
-		// Write metadata.json
-		metadataPath := filepath.Join(resourceOutputPath, "metadata.json")
-		metadataJSON, err := json.MarshalIndent(metadataStruct, "", "  ")
-		if err != nil {
-			return false, fmt.Errorf("marshaling metadata: %w", err)
-		}
-		if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
-			return false, fmt.Errorf("writing metadata.json: %w", err)
-		}
+			// Write create_function_calls.go
+			createFunctionCallsPath := filepath.Join(resourceOutputPath, "create_function_calls.go")
+			if err := writeFunctionsToFile(allFuncDeclList, fileNode, createFunctionCallsPath); err != nil {
+				return false, fmt.Errorf("writing create_function_calls.go: %w", err)
+			}
 
-		// Log statistics
-		fmt.Printf("    Resource: %s (SDK: %s)\n", terraformResourceName[0], sdkResourceName[0])
-		fmt.Printf("    Create function: %s\n", resourceCreateFuncName)
-		fmt.Printf("    Function counts:\n")
-		fmt.Printf("      - Before auxiliary function calls: %d functions\n", len(beforeFuncDeclList))
-		fmt.Printf("      - Intermediate (between auxiliary function calls): %d functions\n", len(intermediateFuncDeclList))
-		fmt.Printf("      - After auxiliary function calls: %d functions\n", len(afterFuncDeclList))
-		fmt.Printf("      - Total functions in call chain: %d functions\n", len(allFuncDeclList))
-		fmt.Printf("    Output directory: %s\n", resourceOutputPath)
+			// Write create_function_only.go
+			createFunctionOnlyPath := filepath.Join(resourceOutputPath, "create_function_only.go")
+			if err := writeFunctionsToFile([]*ast.FuncDecl{resourceCreateFunctionNode}, fileNode, createFunctionOnlyPath); err != nil {
+				return false, fmt.Errorf("writing create_function_only.go: %w", err)
+			}
+
+			// Write metadata.json
+			metadataPath := filepath.Join(resourceOutputPath, "metadata.json")
+			metadataJSON, err := json.MarshalIndent(metadataStruct, "", "  ")
+			if err != nil {
+				return false, fmt.Errorf("marshaling metadata: %w", err)
+			}
+			if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+				return false, fmt.Errorf("writing metadata.json: %w", err)
+			}
+
+			// Log statistics
+			fmt.Printf("    Resource: %s (SDK: %s, Copy %i)\n", terraformResourceName, sdkResourceNameList[0], idx)
+			fmt.Printf("    Create function: %s\n", resourceCreateFuncName)
+			fmt.Printf("    Function counts:\n")
+			fmt.Printf("      - Before auxiliary function calls: %d functions\n", len(beforeFuncDeclList))
+			fmt.Printf("      - Intermediate (between auxiliary function calls): %d functions\n", len(intermediateFuncDeclList))
+			fmt.Printf("      - After auxiliary function calls: %d functions\n", len(afterFuncDeclList))
+			fmt.Printf("      - Total functions in call chain: %d functions\n", len(allFuncDeclList))
+			fmt.Printf("    Output directory: %s\n", resourceOutputPath)
+		}
 	}
 
 	return true, nil
